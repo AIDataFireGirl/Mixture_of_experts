@@ -1,0 +1,503 @@
+---
+# Kubernetes Deployment for MoE Recommendation System
+# This deployment provides scalable, high-availability serving of the MoE model
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: moe-system
+  labels:
+    name: moe-system
+    app: moe-recommendation
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moe-config
+  namespace: moe-system
+data:
+  # Model configuration
+  MODEL_CONFIG: |
+    {
+      "num_experts": 8,
+      "num_experts_per_token": 2,
+      "expert_capacity": 64,
+      "hidden_size": 512,
+      "num_heads": 8,
+      "num_layers": 6,
+      "dropout": 0.1,
+      "vocab_size": 50000,
+      "max_seq_length": 512,
+      "load_balancing_loss_weight": 0.01
+    }
+  
+  # API configuration
+  API_CONFIG: |
+    {
+      "rate_limit_per_minute": 100,
+      "rate_limit_per_user_per_minute": 20,
+      "cache_ttl_seconds": 300,
+      "max_items_per_request": 1000
+    }
+  
+  # Redis configuration
+  REDIS_CONFIG: |
+    {
+      "host": "redis-master.moe-system.svc.cluster.local",
+      "port": 6379,
+      "db": 0,
+      "password": ""
+    }
+
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: moe-secrets
+  namespace: moe-system
+type: Opaque
+data:
+  # Base64 encoded secrets (in production, use proper secret management)
+  jwt-secret: eW91ci1zZWNyZXQta2V5LWhlcmU=  # "your-secret-key-here"
+  redis-password: ""  # Empty for demo, use proper password in production
+
+---
+# Redis StatefulSet for caching and rate limiting
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-master
+  namespace: moe-system
+  labels:
+    app: redis
+    component: cache
+spec:
+  serviceName: redis-master
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      component: cache
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: cache
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --maxmemory
+        - "256mb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: moe-system
+  labels:
+    app: redis
+    component: cache
+spec:
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+    component: cache
+
+---
+# MoE API Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moe-api
+  namespace: moe-system
+  labels:
+    app: moe-api
+    component: api
+spec:
+  replicas: 3  # Start with 3 replicas for high availability
+  selector:
+    matchLabels:
+      app: moe-api
+      component: api
+  template:
+    metadata:
+      labels:
+        app: moe-api
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Use node affinity to ensure GPU nodes if available
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: nvidia.com/gpu
+                operator: Exists
+      containers:
+      - name: moe-api
+        image: moe-recommendation:latest  # Custom image with model
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 8001
+          name: metrics
+        env:
+        - name: REDIS_HOST
+          value: "redis-master.moe-system.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: MODEL_PATH
+          value: "/app/models/moe_model.pth"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: WORKERS
+          value: "1"  # Single worker for model sharing
+        - name: MAX_REQUESTS
+          value: "1000"
+        - name: MAX_REQUESTS_JITTER
+          value: "100"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        # Add GPU resources if available
+        # resources:
+        #   limits:
+        #     nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+          readOnly: true
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: config-volume
+        configMap:
+          name: moe-config
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: moe-model-pvc
+      securityContext:
+        fsGroup: 1000
+
+---
+# Persistent Volume Claim for model storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: moe-model-pvc
+  namespace: moe-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# Service for MoE API
+apiVersion: v1
+kind: Service
+metadata:
+  name: moe-api-service
+  namespace: moe-system
+  labels:
+    app: moe-api
+    component: api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  - port: 8001
+    targetPort: 8001
+    protocol: TCP
+    name: metrics
+  selector:
+    app: moe-api
+    component: api
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: moe-ingress
+  namespace: moe-system
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.moe-recommendation.com
+    secretName: moe-tls-secret
+  rules:
+  - host: api.moe-recommendation.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: moe-api-service
+            port:
+              number: 80
+
+---
+# Horizontal Pod Autoscaler for automatic scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: moe-api-hpa
+  namespace: moe-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: moe-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Object
+    object:
+      metric:
+        name: requests-per-second
+      describedObject:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        name: moe-ingress
+      target:
+        type: AverageValue
+        averageValue: 1000
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+
+---
+# Prometheus ServiceMonitor for metrics collection
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: moe-api-monitor
+  namespace: moe-system
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: moe-api
+      component: api
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+    scrapeTimeout: 10s
+
+---
+# PodDisruptionBudget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: moe-api-pdb
+  namespace: moe-system
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: moe-api
+      component: api
+
+---
+# NetworkPolicy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: moe-api-network-policy
+  namespace: moe-system
+spec:
+  podSelector:
+    matchLabels:
+      app: moe-api
+      component: api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8001
+  - from:
+    - podSelector:
+        matchLabels:
+          app: redis
+          component: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+          component: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+
+---
+# ResourceQuota for namespace limits
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: moe-system-quota
+  namespace: moe-system
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    persistentvolumeclaims: "5"
+    services: "10"
+    services.loadbalancers: "2"
+
+---
+# LimitRange for default resource limits
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: moe-system-limits
+  namespace: moe-system
+spec:
+  limits:
+  - default:
+      cpu: 1000m
+      memory: 2Gi
+    defaultRequest:
+      cpu: 500m
+      memory: 1Gi
+    type: Container 

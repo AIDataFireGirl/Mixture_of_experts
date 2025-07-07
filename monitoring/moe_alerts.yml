@@ -1,0 +1,265 @@
+# Prometheus Alerting Rules for MoE Recommendation System
+# These rules monitor expert activation, latency, and system health
+
+groups:
+  - name: moe-system
+    rules:
+      # High latency alerts
+      - alert: MoEHighLatency
+        expr: histogram_quantile(0.95, rate(moe_request_duration_seconds_bucket[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API high latency detected"
+          description: "95th percentile latency is {{ $value }}s for the last 5 minutes"
+
+      - alert: MoECriticalLatency
+        expr: histogram_quantile(0.95, rate(moe_request_duration_seconds_bucket[5m])) > 0.5
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "MoE API critical latency detected"
+          description: "95th percentile latency is {{ $value }}s for the last 5 minutes"
+
+      # Expert activation alerts
+      - alert: MoEExpertUnderutilization
+        expr: avg(rate(moe_expert_activation_total[5m])) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: experts
+        annotations:
+          summary: "MoE experts underutilized"
+          description: "Average expert activation rate is {{ $value }} per second"
+
+      - alert: MoEExpertOverload
+        expr: avg(rate(moe_expert_activation_total[5m])) > 10
+        for: 2m
+        labels:
+          severity: warning
+          component: experts
+        annotations:
+          summary: "MoE experts overloaded"
+          description: "Average expert activation rate is {{ $value }} per second"
+
+      # Load balancing alerts
+      - alert: MoELoadBalancingIssues
+        expr: moe_load_balancing_loss > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: experts
+        annotations:
+          summary: "MoE load balancing issues detected"
+          description: "Load balancing loss is {{ $value }}"
+
+      # Error rate alerts
+      - alert: MoEHighErrorRate
+        expr: rate(moe_request_errors_total[5m]) / rate(moe_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "MoE API high error rate"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      # Memory usage alerts
+      - alert: MoEHighMemoryUsage
+        expr: (container_memory_usage_bytes{container="moe-api"} / container_spec_memory_limit_bytes{container="moe-api"}) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API high memory usage"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      - alert: MoECriticalMemoryUsage
+        expr: (container_memory_usage_bytes{container="moe-api"} / container_spec_memory_limit_bytes{container="moe-api"}) > 0.95
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "MoE API critical memory usage"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      # CPU usage alerts
+      - alert: MoEHighCPUUsage
+        expr: rate(container_cpu_usage_seconds_total{container="moe-api"}[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API high CPU usage"
+          description: "CPU usage is {{ $value | humanizePercentage }}"
+
+      # Redis alerts
+      - alert: RedisHighMemoryUsage
+        expr: (redis_memory_used_bytes / redis_memory_max_bytes) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Redis high memory usage"
+          description: "Redis memory usage is {{ $value | humanizePercentage }}"
+
+      - alert: RedisConnectionIssues
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: cache
+        annotations:
+          summary: "Redis connection issues"
+          description: "Redis is down or unreachable"
+
+      # Pod health alerts
+      - alert: MoEPodDown
+        expr: up{job="moe-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "MoE API pod down"
+          description: "MoE API pod is down or unreachable"
+
+      - alert: MoEPodRestarting
+        expr: increase(kube_pod_container_status_restarts_total{container="moe-api"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API pod restarting"
+          description: "MoE API pod has restarted in the last 15 minutes"
+
+      # Throughput alerts
+      - alert: MoELowThroughput
+        expr: rate(moe_requests_total[5m]) < 10
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API low throughput"
+          description: "Request rate is {{ $value }} requests per second"
+
+      - alert: MoEHighThroughput
+        expr: rate(moe_requests_total[5m]) > 1000
+        for: 2m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE API high throughput"
+          description: "Request rate is {{ $value }} requests per second"
+
+      # Expert distribution alerts
+      - alert: MoEExpertImbalance
+        expr: stddev(rate(moe_expert_activation_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: experts
+        annotations:
+          summary: "MoE expert load imbalance"
+          description: "Expert activation standard deviation is {{ $value }}"
+
+      # Cache hit rate alerts
+      - alert: MoELowCacheHitRate
+        expr: rate(moe_cache_hits_total[5m]) / (rate(moe_cache_hits_total[5m]) + rate(moe_cache_misses_total[5m])) < 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "MoE low cache hit rate"
+          description: "Cache hit rate is {{ $value | humanizePercentage }}"
+
+      # Model loading alerts
+      - alert: MoEModelNotLoaded
+        expr: moe_model_loaded == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "MoE model not loaded"
+          description: "MoE model is not loaded in the API"
+
+      # Rate limiting alerts
+      - alert: MoERateLimitExceeded
+        expr: rate(moe_rate_limit_exceeded_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "MoE rate limit exceeded"
+          description: "Rate limit exceeded {{ $value }} times in the last 5 minutes"
+
+  - name: kubernetes-system
+    rules:
+      # Node alerts
+      - alert: NodeHighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: node
+        annotations:
+          summary: "Node high CPU usage"
+          description: "CPU usage is {{ $value }}%"
+
+      - alert: NodeHighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: node
+        annotations:
+          summary: "Node high memory usage"
+          description: "Memory usage is {{ $value }}%"
+
+      - alert: NodeDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+          component: node
+        annotations:
+          summary: "Node disk space low"
+          description: "Disk usage is {{ $value }}%"
+
+  - name: infrastructure
+    rules:
+      # Ingress alerts
+      - alert: IngressHighLatency
+        expr: histogram_quantile(0.95, rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])) > 1
+        for: 2m
+        labels:
+          severity: warning
+          component: ingress
+        annotations:
+          summary: "Ingress high latency"
+          description: "95th percentile latency is {{ $value }}s"
+
+      # Certificate alerts
+      - alert: CertificateExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+        for: 1h
+        labels:
+          severity: warning
+          component: tls
+        annotations:
+          summary: "Certificate expiring soon"
+          description: "Certificate expires in {{ $value }} seconds" 
